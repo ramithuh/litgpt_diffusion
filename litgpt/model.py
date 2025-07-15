@@ -15,6 +15,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing_extensions import Self
 
+try:
+    from tzd.models.smdm.fused_rotary_embedding import apply_rotary_emb_func
+except ImportError:
+    apply_rotary_emb_func = None
+
 from litgpt.config import Config
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
@@ -348,6 +353,7 @@ class CausalSelfAttention(nn.Module):
         )
         # output projection
         self.proj = nn.Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
+        self.use_fused_rope =  apply_rotary_emb_func is not None
         # disabled by default
         self.kv_cache: Optional[KVCache] = None
         self.apply_sliding_window_attention = False
@@ -443,8 +449,25 @@ class CausalSelfAttention(nn.Module):
             k = self.norm_k(k)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
-        q_roped = apply_rope(q[..., :rope_n_elem], cos, sin)
-        k_roped = apply_rope(k[..., :rope_n_elem], cos, sin)
+        if self.use_fused_rope and input_pos is None:
+            # Use fused RoPE for training (no KV cache)
+            # Convert to (B, T, nh, hs) format for fused RoPE - same as SMDM
+            q_fused = q.transpose(1, 2)  # (B, T, nh_q, hs)
+            k_fused = k.transpose(1, 2)  # (B, T, nh_k, hs)
+            
+            # Build cos/sin cache in SMDM format: (T, rope_n_elem//2)
+            # LitGPT cos/sin: (1, T, rope_n_elem) -> (T, rope_n_elem//2)
+            cos_fused = cos.squeeze(0)[:, :rope_n_elem//2]  # (T, rope_n_elem//2)
+            sin_fused = sin.squeeze(0)[:, :rope_n_elem//2]  # (T, rope_n_elem//2)
+            
+            # Apply fused RoPE exactly like SMDM: positional args only
+            q_roped = apply_rotary_emb_func(q_fused, cos_fused, sin_fused, False, True).transpose(1, 2)
+            k_roped = apply_rotary_emb_func(k_fused, cos_fused, sin_fused, False, True).transpose(1, 2)
+        else:
+            # Fallback to standard RoPE (for inference with KV cache)
+            q_roped = apply_rope(q[..., :rope_n_elem], cos, sin)
+            k_roped = apply_rope(k[..., :rope_n_elem], cos, sin)
+            
         q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, nh_q, T, hs)
         k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, nh_k, T, hs)
 
@@ -703,7 +726,7 @@ class GptNeoxMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc(x)
-        x = F.gelu(x, approximate=self.config.gelu_approximate)
+        x = F.gelu(x)
         return self.proj(x)
 
 
