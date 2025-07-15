@@ -74,6 +74,8 @@ class Config:
     # `torch.nn.functional.scaled_dot_product_attention` (which implements
     # Flash attention), may result in higher memory and runtime footprint.
     attention_logit_softcapping: Optional[float] = None
+    # Attention causality - True for autoregressive LLMs, False for diffusion models
+    causal: bool = True
     # Rotary position embedding (RoPE)
     rope_base: int = 10000
     rotary_percentage: float = 0.25

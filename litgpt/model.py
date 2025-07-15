@@ -511,7 +511,7 @@ class CausalSelfAttention(nn.Module):
             y = scores @ v
         else:
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
+                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None and self.config.causal
             )
         return y.transpose(1, 2)
 
