@@ -101,6 +101,19 @@ class Config:
     rope_local_base_freq: Optional[float] = None
     rope_indices: Optional[List] = None
 
+    # Pair Bias Configuration (aligned with La-Proteina)
+    # See: la-proteina/proteinfoundation/nn/feature_factory.py (CaCoorsNanometersPairwiseDistancesPairFeat)
+    use_pair_bias: bool = False
+    pair_bias_dim: int = 64
+    pair_bias_n_bins: int = 28           # La-Proteina: 30 output dims → 28 + 2 = 30
+    pair_bias_min_dist: float = 1.0      # La-Proteina: 0.1nm = 1.0Å
+    pair_bias_max_dist: float = 30.0     # La-Proteina: 3.0nm = 30.0Å
+    pair_bias_use_rel_pos: bool = True   # Enable relative sequence separation feature
+    pair_bias_use_ca_dist: bool = True   # Enable C-alpha distance feature
+    tokens_per_residue: int = 10
+    bos_token_id: Optional[int] = None
+    use_flex_attention: bool = True  # Use FlexAttention for memory-efficient pair bias (avoids O(T^2) materialization)
+
     def __post_init__(self):
         if not self.name:
             self.name = self.hf_config.get("name", self.name)

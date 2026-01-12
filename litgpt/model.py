@@ -15,6 +15,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing_extensions import Self
 
+# FlexAttention for memory-efficient pair bias
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    FLEX_ATTENTION_AVAILABLE = True
+    # Compile flex_attention for fused kernel (required for memory efficiency)
+    flex_attention_compiled = torch.compile(flex_attention)
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+    flex_attention = None
+    flex_attention_compiled = None
+    create_block_mask = None
+
 try:
     from tzd.models.smdm.fused_rotary_embedding import apply_rotary_emb_func
 except ImportError:
@@ -22,6 +34,7 @@ except ImportError:
 
 from litgpt.config import Config
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
+from plm.models.modules.pair_bias import PairBiasEncoder, compute_ca_pair_distances
 
 
 class GPT(nn.Module):
@@ -40,6 +53,20 @@ class GPT(nn.Module):
         )
         self.mask_cache: Optional[torch.Tensor] = None
         self.max_seq_length = self.config.block_size
+
+        if config.use_pair_bias:
+            # PairBiasEncoder aligned with La-Proteina's pair bias approach
+            # See: pair_bias_implementation_comparison.md for detailed comparison
+            self.pair_bias_encoder = PairBiasEncoder(
+                n_heads=config.n_head,
+                d_pair=config.pair_bias_dim,
+                n_dist_bins=config.pair_bias_n_bins,
+                min_dist=config.pair_bias_min_dist,  # La-Proteina: 0.1nm = 1.0Å
+                max_dist=config.pair_bias_max_dist,  # La-Proteina: 3.0nm = 30.0Å
+                max_rel_pos=32,  # La-Proteina uses dynamic dim, 32 is reasonable default
+                use_rel_pos=config.pair_bias_use_rel_pos,
+                use_ca_dist=config.pair_bias_use_ca_dist,
+            )
 
     @property
     def max_seq_length(self) -> int:
@@ -91,6 +118,8 @@ class GPT(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
         lm_head_chunk_size: int = 0,
+        coords: Optional[torch.Tensor] = None,
+        pair_bias: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -155,6 +184,33 @@ class GPT(nn.Module):
             mask = None  # defaults to causal mask
             input_pos_maxp1 = None
 
+        tokens_per_residue = self.config.tokens_per_residue
+        offset = 0
+        if self.config.use_pair_bias:
+            if pair_bias is None and coords is not None:
+                # Compute pair bias from coords
+                # coords: (B, L, 3) or (B, L, 37, 3)
+                distances = compute_ca_pair_distances(coords)
+                
+                L_res = distances.size(1)
+                
+                # Efficient BF16 handling + True Lazy Indexing
+                # 1. Compute raw residue bias
+                residue_bias = self.pair_bias_encoder(L_res, distances) # (B, H, L_res, L_res)
+                
+                # 2. Determine padding offset
+                offset = 0
+                if self.config.bos_token_id is not None:
+                     if (idx[:, 0] == self.config.bos_token_id).all():
+                         offset = 1
+                
+                # 3. DO NOT TILE. Pass residue_bias + metadata
+                pair_bias = residue_bias
+            else:
+                # Use stored config value if provided externally
+                # No change needed effectively since we initialized from self.config.tokens_per_residue above
+                pass
+
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
@@ -168,9 +224,12 @@ class GPT(nn.Module):
                     mask,
                     input_pos,
                     input_pos_maxp1,
+                    pair_bias=pair_bias,
+                    tokens_per_residue=tokens_per_residue,
+                    offset=offset
                 )
             else:
-                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset)
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -305,6 +364,9 @@ class Block(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
+        pair_bias: Optional[torch.Tensor] = None,
+        tokens_per_residue: int = 1,
+        offset: int = 0
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -328,7 +390,7 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
+        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset)
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -381,6 +443,9 @@ class CausalSelfAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         input_pos_maxp1: Optional[int] = None,
+        pair_bias: Optional[torch.Tensor] = None,
+        tokens_per_residue: int = 1,
+        offset: int = 0
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -513,7 +578,7 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        y = self.scaled_dot_product_attention(q, k, v, mask)
+        y = self.scaled_dot_product_attention(q, k, v, mask, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset)
 
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, head_size * n_head)
@@ -522,7 +587,9 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)  # (B, T, C)
 
     def scaled_dot_product_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None, pair_bias: Optional[torch.Tensor] = None,
+        tokens_per_residue: int = 1,
+        offset: int = 0
     ) -> torch.Tensor:
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
 
@@ -533,14 +600,173 @@ class CausalSelfAttention(nn.Module):
             if mask is None:
                 mask = torch.ones(q.size(2), q.size(2), dtype=q.dtype, device=q.device).triu(diagonal=1)
                 mask.masked_fill_(mask.bool(), torch.finfo(q.dtype).min)
+
+            # Add pair bias if present (fallback to gathered_bias for softcapping path)
+            if pair_bias is not None:
+                L_res = pair_bias.shape[-1]
+                T = q.size(2)
+                device = pair_bias.device
+                token_idx = torch.arange(T, device=device)
+                residue_idx = (token_idx - offset) // tokens_per_residue
+                is_residue = (residue_idx >= 0) & (residue_idx < L_res)
+                residue_idx = residue_idx.clamp(0, L_res - 1)
+                gathered_bias = pair_bias[:, :, residue_idx, :][:, :, :, residue_idx]
+                valid_bias_mask = is_residue[:, None] & is_residue[None, :]
+                gathered_bias = gathered_bias * valid_bias_mask.to(dtype=gathered_bias.dtype)
+                mask = mask.to(dtype=pair_bias.dtype) + gathered_bias
+
             scores = scores + mask
             scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
             y = scores @ v
         else:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None and self.config.causal
+            # Check if we should use FlexAttention for pair bias (memory-efficient)
+            use_flex = (
+                pair_bias is not None
+                and FLEX_ATTENTION_AVAILABLE
+                and self.config.use_flex_attention
+                and mask is None  # FlexAttention handles causal internally
             )
+
+            if use_flex:
+                y = self._flex_attention_with_pair_bias(
+                    q, k, v, pair_bias, tokens_per_residue, offset, scale
+                )
+            else:
+                # Fallback to standard SDPA path
+                attn_mask = mask
+                is_causal = mask is None and self.config.causal
+
+                if pair_bias is not None:
+                    # If pair_bias is provided, we treat it as an additive mask.
+                    # We need to merge it with the existing mask (if any).
+
+                     # If standard causal mask is implicit (mask is None), we must make it explicit
+                    if is_causal:
+                        # Create causal mask
+                        L, S = q.size(2), k.size(2)
+                        attn_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).triu(diagonal=1)
+                        # Convert to additive
+                        new_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
+                        new_mask.masked_fill_(attn_mask, float("-inf"))
+                        attn_mask = new_mask
+                        is_causal = False
+
+                    # If mask was explicitly provided (e.g. padding mask)
+                    elif attn_mask is not None:
+                         # If boolean, convert to additive
+                        if attn_mask.dtype == torch.bool:
+                            new_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
+                            new_mask.masked_fill_(~attn_mask, float("-inf")) # Assuming True=keep
+                            attn_mask = new_mask
+
+                    # Gather pair bias (this is the memory-heavy path, used as fallback)
+                    L_res = pair_bias.shape[-1]
+                    T = q.size(2)
+                    device = pair_bias.device
+                    token_idx = torch.arange(T, device=device)
+                    residue_idx = (token_idx - offset) // tokens_per_residue
+                    is_residue = (residue_idx >= 0) & (residue_idx < L_res)
+                    residue_idx = residue_idx.clamp(0, L_res - 1)
+                    gathered_bias = pair_bias[:, :, residue_idx, :][:, :, :, residue_idx]
+                    valid_bias_mask = is_residue[:, None] & is_residue[None, :]
+                    gathered_bias = gathered_bias * valid_bias_mask.to(dtype=gathered_bias.dtype)
+
+                    if attn_mask is None:
+                        attn_mask = gathered_bias.to(dtype=q.dtype)
+                    else:
+                        attn_mask = attn_mask.to(dtype=q.dtype) + gathered_bias.to(dtype=q.dtype)
+
+                    # When passing arbitrary float mask, is_causal must be False
+                    is_causal = False
+
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=0.0, scale=scale, is_causal=is_causal
+                )
         return y.transpose(1, 2)
+
+    def _flex_attention_with_pair_bias(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pair_bias: torch.Tensor,
+        tokens_per_residue: int,
+        offset: int,
+        scale: float
+    ) -> torch.Tensor:
+        """
+        Memory-efficient attention with pair bias using FlexAttention.
+
+        Instead of materializing the full (B, H, T, T) bias tensor (~8.5GB for T=3840),
+        we use FlexAttention's score_mod to index into the small residue-level bias
+        (B, H, L_res, L_res) on-the-fly during attention computation.
+
+        Args:
+            q, k, v: Query, key, value tensors (B, H, T, head_size)
+            pair_bias: Residue-level bias (B, H, L_res, L_res)
+            tokens_per_residue: Number of tokens per residue
+            offset: Token offset (e.g., 1 if BOS token present)
+            scale: Attention scale factor (1/sqrt(head_size))
+
+        Returns:
+            Attention output (B, H, T, head_size)
+        """
+        B, H, T, _ = q.shape
+        L_res = pair_bias.shape[-1]
+        device = q.device
+
+        # Pre-scale query (FlexAttention applies scale before score_mod)
+        q_scaled = q * scale
+
+        # Create score_mod that indexes into residue-level bias
+        def score_mod(score, b, h, q_idx, kv_idx):
+            # Map token indices to residue indices
+            res_i = (q_idx - offset) // tokens_per_residue
+            res_j = (kv_idx - offset) // tokens_per_residue
+
+            # Clamp to valid range (out-of-bounds tokens get bias from edge residue,
+            # but will be zeroed by validity mask)
+            res_i_clamped = res_i.clamp(0, L_res - 1)
+            res_j_clamped = res_j.clamp(0, L_res - 1)
+
+            # Check validity (only add bias for actual residue tokens)
+            is_valid_i = (res_i >= 0) & (res_i < L_res)
+            is_valid_j = (res_j >= 0) & (res_j < L_res)
+            is_valid = is_valid_i & is_valid_j
+
+            # Index into pair_bias: pair_bias[b, h, res_i, res_j]
+            bias = pair_bias[b, h, res_i_clamped, res_j_clamped]
+
+            # Zero out bias for invalid positions (BOS/EOS/padding)
+            bias = torch.where(is_valid, bias, torch.zeros_like(bias))
+
+            return score + bias
+
+        block_mask = None
+        if self.config.causal:
+            # Create block mask for causal attention
+            def causal_mask(b, h, q_idx, kv_idx):
+                return q_idx >= kv_idx
+
+            block_mask = create_block_mask(
+                causal_mask,
+                B=B,
+                H=H,
+                Q_LEN=T,
+                KV_LEN=T,
+                device=device
+            )
+
+        # Run FlexAttention with score_mod (compiled for fused kernel)
+        # Note: flex_attention expects scale=1.0 when query is pre-scaled
+        y = flex_attention_compiled(
+            q_scaled, k, v,
+            score_mod=score_mod,
+            block_mask=block_mask,
+            scale=1.0
+        )
+
+        return y
 
     def build_kv_cache(
         self,
