@@ -25,11 +25,11 @@ import torch.nn as nn
 import torch.utils._device
 import yaml
 from lightning.fabric.loggers import CSVLogger, TensorBoardLogger
-from lightning.fabric.strategies import FSDPStrategy
+from lightning.fabric.strategies import FSDPStrategy, ModelParallelStrategy
 from lightning.fabric.utilities.load import _lazy_load as lazy_load
 from lightning.pytorch.cli import instantiate_class
 from lightning.pytorch.loggers import MLFlowLogger, WandbLogger
-from lightning_utilities.core.imports import module_available
+from lightning_utilities.core.imports import RequirementCache, module_available
 from packaging import version
 from torch.serialization import normalize_storage_type
 from typing_extensions import Self
@@ -37,8 +37,19 @@ from typing_extensions import Self
 if TYPE_CHECKING:
     from litgpt import GPT, Config
 
+_TORCH_EQUAL_2_7 = RequirementCache("torch>=2.7.0,<2.8")
+_TORCH_EQUAL_2_8 = RequirementCache("torch>=2.8.0,<2.9")
+_REQUESTS_AVAILABLE = RequirementCache("requests")
 _THUNDER_AVAILABLE = module_available("thunder")
 _TRITON_AVAILABLE = module_available("triton")
+_BITANDBYTES_AVAILABLE = module_available("bitsandbytes")
+_BITANDBYTES_AVAILABLE_NOT_EQUAL_0_42_0 = RequirementCache("bitsandbytes != 0.42.0")
+_LITDATA_AVAILABLE = RequirementCache("litdata")
+_LITSERVE_AVAILABLE = RequirementCache("litserve")
+_JINJA2_AVAILABLE = RequirementCache("jinja2")
+_TRANSFORMERS_GREATER_EQUAL_4_52 = RequirementCache("transformers>=4.52.0")
+_SAFETENSORS_AVAILABLE = RequirementCache("safetensors")
+_HF_TRANSFER_AVAILABLE = RequirementCache("hf_transfer")
 
 
 def init_out_dir(out_dir: Path) -> Path:
@@ -379,6 +390,15 @@ def get_default_supported_precision(training: bool) -> str:
 def load_checkpoint(fabric: L.Fabric, model: nn.Module, checkpoint_path: Path, strict: bool = True) -> None:
     if isinstance(fabric.strategy, FSDPStrategy):
         fabric.load_raw(checkpoint_path, model, strict=strict)
+    elif isinstance(fabric.strategy, ModelParallelStrategy):
+        state_dict = torch.load(checkpoint_path, mmap=True)
+        load_from_full_model_state_dict(
+            model=model,
+            full_sd=state_dict,
+            device=fabric.device,
+            strict=strict,
+            cpu_offload=True,
+        )
     else:
         state_dict = lazy_load(checkpoint_path)
         state_dict = state_dict.get("model", state_dict)
@@ -396,6 +416,41 @@ def load_checkpoint_update(
         adapter_cp = lazy_load(adapter_path)
         state_dict.update(adapter_cp)
         model.load_state_dict(state_dict, strict=strict)
+
+
+def load_from_full_model_state_dict(
+    model: torch.nn.Module,
+    full_sd: Dict[str, Any],
+    device: torch.device,
+    strict: bool = False,
+    cpu_offload: bool = False,
+):
+    from torch.distributed._tensor import distribute_tensor
+
+    meta_sharded_sd = model.state_dict()
+    sharded_sd = {}
+    print(meta_sharded_sd.keys())
+    for param_name, full_tensor in full_sd.items():
+        if "norm" not in param_name and "wte" not in param_name and "ln_f" not in param_name:
+            param_name = param_name.replace(".weight", ".linear.weight")
+            param_name = param_name.replace(".bias", ".linear.bias")
+        else:
+            param_name = param_name
+
+        print(param_name)
+
+        sharded_meta_param = meta_sharded_sd.get(param_name)
+        full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
+        sharded_tensor = distribute_tensor(
+            full_tensor,
+            sharded_meta_param.device_mesh,
+            sharded_meta_param.placements,
+        )
+        if cpu_offload:
+            sharded_tensor = sharded_tensor.cpu()
+        sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+    # choose `assign=True` since we cannot call `copy_` on meta tensor
+    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
 
 
 def flops_per_param(max_seq_length: int, n_layer: int, n_embd: int, n_params: int) -> int:

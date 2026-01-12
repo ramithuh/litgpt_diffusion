@@ -95,6 +95,7 @@ class Config:
     final_logit_softcapping: Optional[float] = None
     norm_1: bool = True
     norm_2: bool = True
+    latent_attention: Optional[dict] = None
     # The base period of the RoPE embeddings for local attention.
     # If not provided, rope_theta will be used for both local and global attention.
     rope_local_base_freq: Optional[float] = None
@@ -134,6 +135,23 @@ class Config:
 
         if self.rope_local_base_freq is not None and self.rope_indices is None:
             self.rope_indices = [1] * self.n_layer
+
+        if self.latent_attention is not None:
+            self.q_lora_rank = self.latent_attention.get("q_lora_rank")
+            self.kv_lora_rank = self.latent_attention.get("kv_lora_rank")
+            self.qk_rope_head_dim = self.latent_attention.get("qk_rope_head_dim")
+            self.qk_nope_head_dim = self.latent_attention.get("qk_nope_head_dim")
+            self.v_head_dim = self.latent_attention.get("v_head_dim")
+            assert (
+                self.q_lora_rank
+                and self.kv_lora_rank
+                and self.qk_rope_head_dim
+                and self.qk_nope_head_dim
+                and self.v_head_dim
+            ) is not None
+            assert self.n_head == self.n_query_groups, "Latent attention does not support MQA/GQA"
+            self.qk_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
+            self.rope_n_elem = self.qk_rope_head_dim
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Optional[Self]:
@@ -2861,6 +2879,87 @@ qwen_3_moe = [
 ]
 configs.extend(qwen_3_moe)
 
+qwen_3_2507_thinking_instruct = [
+    # https://huggingface.co/Qwen/Qwen3-235B-A22B-Thinking-2507/blob/main/config.json
+    dict(
+        name="Qwen3-235B-A22B-{}-2507",
+        hf_config=dict(org="Qwen", name="Qwen3-235B-A22B-{}-2507"),
+        block_size=262144,
+        head_size=128,
+        vocab_size=151643,
+        padded_vocab_size=151936,
+        n_layer=94,
+        n_head=64,
+        n_embd=4096,
+        n_query_groups=4,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="RMSNorm",
+        mlp_class_name="LLaMAMoE",
+        intermediate_size=12288,
+        moe_intermediate_size=1536,
+        norm_eps=1e-6,
+        rope_base=5000000,
+        norm_qk=True,
+        n_expert=128,
+        n_expert_per_token=8,
+    ),
+    # https://huggingface.co/Qwen/Qwen3-30B-A3B-Thinking-2507/blob/main/config.json
+    dict(
+        name="Qwen3-30B-A3B-{}-2507",
+        hf_config=dict(org="Qwen", name="Qwen3-30B-A3B-{}-2507"),
+        block_size=262144,
+        head_size=128,
+        vocab_size=151643,
+        padded_vocab_size=151936,
+        n_layer=48,
+        n_head=32,
+        n_embd=2048,
+        n_query_groups=4,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="RMSNorm",
+        mlp_class_name="LLaMAMoE",
+        intermediate_size=6144,
+        moe_intermediate_size=768,
+        norm_eps=1e-6,
+        rope_base=10000000,
+        norm_qk=True,
+        n_expert=128,
+        n_expert_per_token=8,
+    ),
+    # https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507/blob/main/config.json
+    dict(
+        name="Qwen3-4B-{}-2507",
+        hf_config=dict(org="Qwen", name="Qwen3-4B-{}-2507"),
+        block_size=262144,
+        vocab_size=151643,
+        padded_vocab_size=151936,
+        n_layer=36,
+        n_head=32,
+        n_embd=2560,
+        n_query_groups=8,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="RMSNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=9728,
+        norm_eps=1e-6,
+        rope_base=5000000,
+        head_size=128,
+        norm_qk=True,
+    ),
+]
+
+for c in qwen_3_2507_thinking_instruct:
+    for kind in ("Thinking", "Instruct"):
+        copy = deepcopy(c)
+        copy["name"] = c["name"].format(kind)
+        copy["hf_config"]["name"] = c["hf_config"]["name"].format(kind)
+        configs.append(copy)
 
 #############
 # Salamandra
