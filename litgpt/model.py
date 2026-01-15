@@ -120,6 +120,7 @@ class GPT(nn.Module):
         lm_head_chunk_size: int = 0,
         coords: Optional[torch.Tensor] = None,
         pair_bias: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -226,10 +227,11 @@ class GPT(nn.Module):
                     input_pos_maxp1,
                     pair_bias=pair_bias,
                     tokens_per_residue=tokens_per_residue,
-                    offset=offset
+                    offset=offset,
+                    padding_mask=padding_mask
                 )
             else:
-                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset)
+                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset, padding_mask=padding_mask)
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -366,7 +368,8 @@ class Block(nn.Module):
         input_pos_maxp1: Optional[int] = None,
         pair_bias: Optional[torch.Tensor] = None,
         tokens_per_residue: int = 1,
-        offset: int = 0
+        offset: int = 0,
+        padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -390,7 +393,7 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset)
+        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset, padding_mask=padding_mask)
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -445,7 +448,8 @@ class CausalSelfAttention(nn.Module):
         input_pos_maxp1: Optional[int] = None,
         pair_bias: Optional[torch.Tensor] = None,
         tokens_per_residue: int = 1,
-        offset: int = 0
+        offset: int = 0,
+        padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -578,7 +582,7 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        y = self.scaled_dot_product_attention(q, k, v, mask, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset)
+        y = self.scaled_dot_product_attention(q, k, v, mask, pair_bias=pair_bias, tokens_per_residue=tokens_per_residue, offset=offset, padding_mask=padding_mask)
 
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, head_size * n_head)
@@ -589,9 +593,23 @@ class CausalSelfAttention(nn.Module):
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None, pair_bias: Optional[torch.Tensor] = None,
         tokens_per_residue: int = 1,
-        offset: int = 0
+        offset: int = 0,
+        padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
+
+        # Convert padding_mask (B, T) to attention mask format
+        # padding_mask: True = valid token, False = padding token
+        # Create full pairwise mask (B, 1, T, T) to mask both query and key padding positions
+        # This matches La-Proteina's approach: pair_mask = mask[:, :, None] & mask[:, None, :]
+        padding_attn_mask = None
+        if padding_mask is not None:
+            B_pad, T_pad = padding_mask.shape
+            # Create pairwise mask: valid only if BOTH query and key are valid
+            pairwise_valid = padding_mask[:, :, None] & padding_mask[:, None, :]  # (B, T, T)
+            # Convert to additive mask with -inf for invalid positions
+            padding_attn_mask = torch.zeros(B_pad, 1, T_pad, T_pad, dtype=q.dtype, device=q.device)
+            padding_attn_mask.masked_fill_(~pairwise_valid.unsqueeze(1), float("-inf"))
 
         # with softcapping we cannot use SDPA
         if self.config.attention_logit_softcapping is not None:
@@ -616,6 +634,9 @@ class CausalSelfAttention(nn.Module):
                 mask = mask.to(dtype=pair_bias.dtype) + gathered_bias
 
             scores = scores + mask
+            # Apply padding mask: mask out attention to padding tokens
+            if padding_attn_mask is not None:
+                scores = scores + padding_attn_mask
             scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
             y = scores @ v
         else:
@@ -629,12 +650,25 @@ class CausalSelfAttention(nn.Module):
 
             if use_flex:
                 y = self._flex_attention_with_pair_bias(
-                    q, k, v, pair_bias, tokens_per_residue, offset, scale
+                    q, k, v, pair_bias, tokens_per_residue, offset, scale, padding_mask=padding_mask
                 )
             else:
                 # Fallback to standard SDPA path
                 attn_mask = mask
                 is_causal = mask is None and self.config.causal
+
+                # Apply padding mask if provided (for diffusion models with bidirectional attention)
+                if padding_attn_mask is not None:
+                    if attn_mask is None:
+                        attn_mask = padding_attn_mask
+                    else:
+                        # Convert existing mask to float if needed
+                        if attn_mask.dtype == torch.bool:
+                            new_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
+                            new_mask.masked_fill_(~attn_mask, float("-inf"))
+                            attn_mask = new_mask
+                        attn_mask = attn_mask + padding_attn_mask
+                    is_causal = False  # Can't use is_causal with explicit mask
 
                 if pair_bias is not None:
                     # If pair_bias is provided, we treat it as an additive mask.
@@ -692,7 +726,8 @@ class CausalSelfAttention(nn.Module):
         pair_bias: torch.Tensor,
         tokens_per_residue: int,
         offset: int,
-        scale: float
+        scale: float,
+        padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Memory-efficient attention with pair bias using FlexAttention.
@@ -707,6 +742,7 @@ class CausalSelfAttention(nn.Module):
             tokens_per_residue: Number of tokens per residue
             offset: Token offset (e.g., 1 if BOS token present)
             scale: Attention scale factor (1/sqrt(head_size))
+            padding_mask: Optional (B, T) mask where True=valid, False=padding
 
         Returns:
             Attention output (B, H, T, head_size)
@@ -739,6 +775,15 @@ class CausalSelfAttention(nn.Module):
 
             # Zero out bias for invalid positions (BOS/EOS/padding)
             bias = torch.where(is_valid, bias, torch.zeros_like(bias))
+
+            # Apply padding mask: set score to -inf if either query or key is padding
+            # This matches La-Proteina's pairwise mask: pair_mask = mask[:, :, None] & mask[:, None, :]
+            if padding_mask is not None:
+                is_padding_q = ~padding_mask[b, q_idx]   # True if query is padding
+                is_padding_kv = ~padding_mask[b, kv_idx]  # True if key is padding
+                is_masked = is_padding_q | is_padding_kv  # Mask if either is padding
+                score = torch.where(is_masked, torch.tensor(float("-inf"), device=score.device, dtype=score.dtype), score + bias)
+                return score
 
             return score + bias
 
