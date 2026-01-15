@@ -782,7 +782,8 @@ class CausalSelfAttention(nn.Module):
                 is_padding_q = ~padding_mask[b, q_idx]   # True if query is padding
                 is_padding_kv = ~padding_mask[b, kv_idx]  # True if key is padding
                 is_masked = is_padding_q | is_padding_kv  # Mask if either is padding
-                score = torch.where(is_masked, torch.tensor(float("-inf"), device=score.device, dtype=score.dtype), score + bias)
+                # Use scalar -inf instead of torch.tensor() to avoid inductor lowering issues in PyTorch 2.7+
+                score = torch.where(is_masked, float("-inf"), score + bias) 
                 return score
 
             return score + bias
