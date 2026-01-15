@@ -640,12 +640,13 @@ class CausalSelfAttention(nn.Module):
             scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
             y = scores @ v
         else:
-            # Check if we should use FlexAttention for pair bias (memory-efficient)
+            # Check if we should use FlexAttention (memory-efficient for pair bias and/or padding mask)
             use_flex = (
-                pair_bias is not None
-                and FLEX_ATTENTION_AVAILABLE
+                FLEX_ATTENTION_AVAILABLE
                 and self.config.use_flex_attention
                 and mask is None  # FlexAttention handles causal internally
+                and (pair_bias is not None or padding_mask is not None)  # Need something to apply
+                and q.is_cuda  # FlexAttention only works on CUDA
             )
 
             if use_flex:
@@ -748,33 +749,39 @@ class CausalSelfAttention(nn.Module):
             Attention output (B, H, T, head_size)
         """
         B, H, T, _ = q.shape
-        L_res = pair_bias.shape[-1]
+        L_res = pair_bias.shape[-1] if pair_bias is not None else 0
         device = q.device
 
         # Pre-scale query (FlexAttention applies scale before score_mod)
         q_scaled = q * scale
 
-        # Create score_mod that indexes into residue-level bias
+        # Create score_mod that handles pair bias and/or padding mask
         def score_mod(score, b, h, q_idx, kv_idx):
-            # Map token indices to residue indices
-            res_i = (q_idx - offset) // tokens_per_residue
-            res_j = (kv_idx - offset) // tokens_per_residue
+            # Start with the raw score
+            modified_score = score
 
-            # Clamp to valid range (out-of-bounds tokens get bias from edge residue,
-            # but will be zeroed by validity mask)
-            res_i_clamped = res_i.clamp(0, L_res - 1)
-            res_j_clamped = res_j.clamp(0, L_res - 1)
+            # Apply pair bias if provided
+            if pair_bias is not None:
+                # Map token indices to residue indices
+                res_i = (q_idx - offset) // tokens_per_residue
+                res_j = (kv_idx - offset) // tokens_per_residue
 
-            # Check validity (only add bias for actual residue tokens)
-            is_valid_i = (res_i >= 0) & (res_i < L_res)
-            is_valid_j = (res_j >= 0) & (res_j < L_res)
-            is_valid = is_valid_i & is_valid_j
+                # Clamp to valid range (out-of-bounds tokens get bias from edge residue,
+                # but will be zeroed by validity mask)
+                res_i_clamped = res_i.clamp(0, L_res - 1)
+                res_j_clamped = res_j.clamp(0, L_res - 1)
 
-            # Index into pair_bias: pair_bias[b, h, res_i, res_j]
-            bias = pair_bias[b, h, res_i_clamped, res_j_clamped]
+                # Check validity (only add bias for actual residue tokens)
+                is_valid_i = (res_i >= 0) & (res_i < L_res)
+                is_valid_j = (res_j >= 0) & (res_j < L_res)
+                is_valid = is_valid_i & is_valid_j
 
-            # Zero out bias for invalid positions (BOS/EOS/padding)
-            bias = torch.where(is_valid, bias, torch.zeros_like(bias))
+                # Index into pair_bias: pair_bias[b, h, res_i, res_j]
+                bias = pair_bias[b, h, res_i_clamped, res_j_clamped]
+
+                # Zero out bias for invalid positions (BOS/EOS/padding)
+                bias = torch.where(is_valid, bias, torch.zeros_like(bias))
+                modified_score = modified_score + bias
 
             # Apply padding mask: set score to -inf if either query or key is padding
             # This matches La-Proteina's pairwise mask: pair_mask = mask[:, :, None] & mask[:, None, :]
@@ -783,10 +790,9 @@ class CausalSelfAttention(nn.Module):
                 is_padding_kv = ~padding_mask[b, kv_idx]  # True if key is padding
                 is_masked = is_padding_q | is_padding_kv  # Mask if either is padding
                 # Use scalar -inf instead of torch.tensor() to avoid inductor lowering issues in PyTorch 2.7+
-                score = torch.where(is_masked, float("-inf"), score + bias) 
-                return score
+                modified_score = torch.where(is_masked, float("-inf"), modified_score)
 
-            return score + bias
+            return modified_score
 
         block_mask = None
         if self.config.causal:
